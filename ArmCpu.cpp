@@ -129,17 +129,35 @@ static uint64_t counter (void)
   return value;
 }
 
+// Polls until the bits clear. The limit counts polls as well as time: the counter runs on while the host has this vCPU's thread
+// descheduled, so a time limit alone (it was 100 ms) can fail a wake that had no chance to complete.
 static bool waitClear (uintptr_t base, unsigned offset, uint32_t mask)
 {
   uint64_t frequency;
   __asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (frequency));
   uint64_t started = counter ();
-  while ((read32 (base, offset) & mask) != 0) {
-    if (counter () - started > frequency / 10) {
+  for (unsigned polls = 0; (read32 (base, offset) & mask) != 0; ++polls) {
+    if (polls > 100000 && counter () - started > frequency) {
       return false;
     }
   }
   return true;
+}
+
+// Parks a core that cannot join for good, in WFI with its virtual timer and Group 1 interrupts off, so that it waits blocked:
+// Gunyah traps WFI and blocks the vCPU but runs WFE in the guest, and a vCPU left in WFE kept its physical core until the host's
+// watchdog rebooted the phone.
+static void __attribute__ ((noreturn)) parkCore (void)
+{
+  __asm__ volatile ("msr daifset, #0xf\n msr cntv_ctl_el0, xzr\n isb" ::: "memory");
+  uint64_t pfr0;
+  __asm__ volatile ("mrs %0, id_aa64pfr0_el1" : "=r" (pfr0));
+  if (((pfr0 >> 24) & 0xf) != 0) {
+    uint64_t sre;
+    __asm__ volatile ("mrs %0, S3_0_C12_C12_5" : "=r" (sre));           // ICC_SRE_EL1
+    if ((sre & 1) != 0) { __asm__ volatile ("msr S3_0_C12_C12_7, xzr\n isb" ::: "memory"); }   // ICC_IGRPEN1_EL1
+  }
+  for (;;) { __asm__ volatile ("dsb sy\n wfi" ::: "memory"); }
 }
 
 // GIC state shared by all CPU nubs. The boot CPU maps the distributor and redistributor frames; a secondary core
@@ -519,8 +537,8 @@ void ArmCpu::initCPU (bool boot)
     __asm__ volatile ("mrs %0, mpidr_el1" : "=r" (mpidr));
     armcpu_smp_seen_mpidr[logicalId] = static_cast<uint32_t> (mpidr);
     // A failure is recorded and the core parked (rather than a panic that hides the other cores' state).
-    if ((mpidr & 0xffff) != (affinity & 0xffff)) { armcpu_smp_fail[logicalId] = 1; for (;;) { __asm__ volatile ("wfe"); } }
-    if (!gRemoteGic && !wakeRedistributor (true)) { armcpu_smp_fail[logicalId] = 2; for (;;) { __asm__ volatile ("wfe"); } }
+    if ((mpidr & 0xffff) != (affinity & 0xffff)) { armcpu_smp_fail[logicalId] = 1; parkCore (); }
+    if (!gRemoteGic && !wakeRedistributor (true)) { armcpu_smp_fail[logicalId] = 2; parkCore (); }
     armcpu_smp_step[logicalId] = 6;
     enableGic ();
     if (gSpiIpi) { spiIpiConfigure (gDist, logicalId, affinity); }
