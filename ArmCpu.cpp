@@ -33,6 +33,11 @@ volatile uint32_t armcpu_core_timer[8], armcpu_core_sgi[8];   // per logical cor
 static bool gSpiIpi = false;                // boot-arg armcpu-spi-ipi=1: IPIs are software-pended SPIs 1008+core routed to that core (ICC_SGI1R_EL1 generates nothing on this board)
 static bool gSelfIpi = false;               // boot-arg armcpu-self-ipi=1: every core sends itself SGI 0 from initCPU
 volatile uint32_t armcpu_irq_phase = 0,armcpu_irq_id = 1023;
+// IRQ drains (ArmCpu::interrupt takes interrupts until none is pending) that took more than 128, and the most one took. A burst
+// of timer pops is normal under a hypervisor: a vCPU held off its core finds the next deadline rtclock_intr set already past
+// when it signals end of interrupt, and the virtual timer fires again.
+volatile uint64_t armcpu_irq_long_drains = 0;
+volatile uint32_t armcpu_irq_drain_most = 0;
 volatile uint32_t armcpu_quiesce_calls = 0,armcpu_halt_calls = 0;
 // Secondary-CPU bring-up evidence (sheng-smp=1). Step values: 1 nub started, 2 registered, 3 start thread running,
 // 4 PSCI CPU_ON issued, 5 entered initCPU on the new core, 6 GIC redistributor ready, 7 running.
@@ -581,8 +586,15 @@ void ArmCpu::interrupt (void)
     uint64_t id;
     __asm__ volatile ("mrs %0, icc_iar1_el1" : "=r" (id));
     armcpu_irq_id=static_cast<uint32_t>(id & 0xffffff);
-    if ((id & 0xffffff) >= 1020) { armcpu_irq_phase=0;break; }
-    if(diagnosePower && ++drained>128)panic("ArmCpu: IRQ drain exceeds 128 id=%llx timer=%llu IPI=%llu",id,armcpu_timer_interrupts,armcpu_ipi_interrupts);
+    if ((id & 0xffffff) >= 1020) {
+      armcpu_irq_phase=0;
+      if (drained > 128) { armcpu_irq_long_drains = armcpu_irq_long_drains + 1; }
+      if (drained > armcpu_irq_drain_most) { armcpu_irq_drain_most = drained; }
+      break;
+    }
+    // Only an interrupt that never stops coming (a level line nobody clears) is a fault: a million in one drain.
+    ++drained;
+    if(diagnosePower && drained>1000000)panic("ArmCpu: IRQ drain exceeds 1000000 id=%llx timer=%llu IPI=%llu",id,armcpu_timer_interrupts,armcpu_ipi_interrupts);
     if ((id & 0xffffff) == 27) {
       armcpu_timer_interrupts = armcpu_timer_interrupts + 1;
       armcpu_core_timer[logicalId & 7] = armcpu_core_timer[logicalId & 7] + 1;
