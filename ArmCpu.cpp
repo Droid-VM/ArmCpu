@@ -4,6 +4,7 @@
 #include <IOKit/IOMemoryDescriptor.h>
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSSymbol.h>
+#include <libkern/version.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 
@@ -434,7 +435,19 @@ bool ArmCpu::start (IOService *provider)
   info.log_id = logicalId;
   info.cluster_id = static_cast<uint32_t> (ml_get_cluster_number (physical));
   info.cluster_type = clusterType (physical);
+  // Darwin 25 kernels (xnu-12377) boot the processor from ml_processor_register, which calls initCPU and enables the GIC and
+  // timer, so the boot CPU registers once its interrupt handler below is installed. Darwin 23 (xnu-10063) leaves initCPU to the
+  // driver and registers first, as before: registering after the handler there cost a DroidVM guest half its frame rate
+  // (backboardd 92-227 ms a frame against 9 ms, measured 2026-10-29).
+  const bool registerLate = version_major >= 25;
+  perfmon_interrupt_handler_func pmi = nullptr;
+  kern_return_t status = KERN_SUCCESS;
+  if (!registerLate) {
+    status = ml_processor_register (&info, &machProcessor, &ipi_handler, &pmi);
+    if (status != KERN_SUCCESS) { panic ("ArmCpu: CPU %u registration failed: %d", logicalId, status); }
+  }
   setCPUNumber (info.log_id);
+  if (!registerLate) { armcpu_registered = 1; }
   unsigned smp = 0;
   PE_parse_boot_argn ("sheng-smp", &smp, sizeof (smp));
   gSmpWanted = smp != 0;
@@ -453,12 +466,11 @@ bool ArmCpu::start (IOService *provider)
     panic ("ArmCpu: CPU IRQ action registration failed");
   }
   gController = controller;
-  // Newer kernels boot the processor from ml_processor_register, which calls initCPU and enables the GIC and
-  // timer; the handler above must already be installed. Older kernels leave initCPU to the driver.
-  perfmon_interrupt_handler_func pmi = nullptr;
-  kern_return_t status = ml_processor_register (&info, &machProcessor, &ipi_handler, &pmi);
-  if (status != KERN_SUCCESS) { panic ("ArmCpu: CPU %u registration failed: %d", logicalId, status); }
-  armcpu_registered = 1;
+  if (registerLate) {
+    status = ml_processor_register (&info, &machProcessor, &ipi_handler, &pmi);
+    if (status != KERN_SUCCESS) { panic ("ArmCpu: CPU %u registration failed: %d", logicalId, status); }
+    armcpu_registered = 1;
+  }
   if (!bootInitialized) { initCPU (true); }
   registerService ();
   __atomic_store_n (&gBootRegistered, 1U, __ATOMIC_RELEASE);
