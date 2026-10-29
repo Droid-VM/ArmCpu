@@ -64,6 +64,7 @@ class ArmCpu : public IOCPU {
   bool skipGic = false;
   bool diagnosePower = false;
   bool secondary = false;
+  bool bootInitialized = false;
   uint32_t logicalId = 0;
   bool mapGic (void);
   bool initDistributor (void);
@@ -125,6 +126,16 @@ static void spiIpiSend (uintptr_t dist, uint32_t core)
   __asm__ volatile ("dsb ishst" ::: "memory");
   write32 (dist, 0x200 + (id / 32) * 4, 1U << (id % 32));
   __asm__ volatile ("dsb sy" ::: "memory");
+}
+
+// The cluster type the ADT gives this core (cluster-type 'E' or 'P'), so each cluster registers as its own processor set.
+static cluster_type_t clusterType (uint32_t physical)
+{
+  const ml_topology_info_t *topology = ml_get_topology_info ();
+  for (unsigned i = 0; i < topology->num_cpus; i++) {
+    if (topology->cpus[i].phys_id == physical) { return topology->cpus[i].cluster_type; }
+  }
+  return ml_get_boot_cluster_type ();
 }
 
 static uint64_t counter (void)
@@ -422,12 +433,8 @@ bool ArmCpu::start (IOService *provider)
   info.phys_id = physical;
   info.log_id = logicalId;
   info.cluster_id = static_cast<uint32_t> (ml_get_cluster_number (physical));
-  info.cluster_type = ml_get_boot_cluster_type ();
-  perfmon_interrupt_handler_func pmi = nullptr;
-  kern_return_t status = ml_processor_register (&info, &machProcessor, &ipi_handler, &pmi);
-  if (status != KERN_SUCCESS) { panic ("ArmCpu: CPU %u registration failed: %d", logicalId, status); }
+  info.cluster_type = clusterType (physical);
   setCPUNumber (info.log_id);
-  armcpu_registered = 1;
   unsigned smp = 0;
   PE_parse_boot_argn ("sheng-smp", &smp, sizeof (smp));
   gSmpWanted = smp != 0;
@@ -446,7 +453,13 @@ bool ArmCpu::start (IOService *provider)
     panic ("ArmCpu: CPU IRQ action registration failed");
   }
   gController = controller;
-  initCPU (true);
+  // Newer kernels boot the processor from ml_processor_register, which calls initCPU and enables the GIC and
+  // timer; the handler above must already be installed. Older kernels leave initCPU to the driver.
+  perfmon_interrupt_handler_func pmi = nullptr;
+  kern_return_t status = ml_processor_register (&info, &machProcessor, &ipi_handler, &pmi);
+  if (status != KERN_SUCCESS) { panic ("ArmCpu: CPU %u registration failed: %d", logicalId, status); }
+  armcpu_registered = 1;
+  if (!bootInitialized) { initCPU (true); }
   registerService ();
   __atomic_store_n (&gBootRegistered, 1U, __ATOMIC_RELEASE);
   drainPending ();
@@ -472,7 +485,7 @@ bool ArmCpu::finishSecondary (void)
   info.phys_id = static_cast<uint32_t> (affinity);
   info.log_id = logicalId;
   info.cluster_id = static_cast<uint32_t> (ml_get_cluster_number (static_cast<uint32_t> (affinity)));
-  info.cluster_type = ml_get_boot_cluster_type ();
+  info.cluster_type = clusterType (static_cast<uint32_t> (affinity));
   perfmon_interrupt_handler_func pmi = nullptr;
   kern_return_t status = ml_processor_register (&info, &machProcessor, &ipi_handler, &pmi);
   if (status != KERN_SUCCESS) { armcpu_smp_fail[logicalId] = 4; return false; }
@@ -520,6 +533,13 @@ void ArmCpu::startThread (void *argument, wait_result_t)
   armcpu_smp_step[self->logicalId] = 3;
   // Blocks until the new core reaches the scheduler; a core that never arrives only stalls this helper thread.
   processor_start (self->machProcessor);
+  // Once every secondary core has started, the scheduler sets up its cluster edges (Edge migration and steal rules).
+  static uint32_t started = 0;
+  // armcpu-edge=0 leaves the Edge matrix all-disallowed (no thread moves between clusters). On iPadOS 27 the matrix fails the scheduler's
+  // own consistency check, which the kernel now reports instead of asserting.
+  unsigned edge = 0;
+  PE_parse_boot_argn ("armcpu-edge", &edge, sizeof (edge));
+  if (__atomic_add_fetch (&started, 1U, __ATOMIC_ACQ_REL) + 1 == ml_get_topology_info ()->num_cpus && edge != 0) { ml_cpu_init_completed (); }
   thread_terminate (current_thread ());
 }
 
@@ -564,12 +584,14 @@ void ArmCpu::initCPU (bool boot)
     // Explicit A/B hardware diagnostic: do not touch GIC MMIO or enable an
     // interrupt source. CPU registration still happens; the timer is left off.
     setCPUState (kIOCPUStateRunning);
+    bootInitialized = true;
     return;
   }
   enableGic ();
   if (gSpiIpi) { spiIpiConfigure (gDist, logicalId, affinity); }
   enableCPUTimeBase (true);
   setCPUState (kIOCPUStateRunning);
+  bootInitialized = true;
   if (gSelfIpi) { signalCPU (this); }
 }
 
