@@ -109,11 +109,27 @@ static void write32 (uintptr_t base, unsigned offset, uint32_t value)
 }
 
 // Distributor side of the software IPI of logical core `core`: group 1, edge-triggered, priority 0x80, routed to affinity `aff`, enabled.
+// The cores' IPI SPIs share their group and configuration words (INTIDs 1008..1015: one GICD_IGROUPR word, one GICD_ICFGR word), and
+// the secondary cores configure theirs at the same time: one core's read-modify-write could write back a word read before another
+// core set its bit, leaving that core's IPI level-triggered. A level SPI pended through GICD_ISPENDR stays pending once taken, so that
+// core took its IPI again at once, forever (iPadOS 27 DroidVM board: 1.58 million a second on one core while 60 thousand were sent in
+// all, a vCPU at 100% on the phone; core 4 in one boot, core 5 in the next). The words are written under a lock and read back.
+static uint32_t gSpiIpiLock = 0;
+extern "C" volatile uint32_t armcpu_spi_ipi_retries;
+volatile uint32_t armcpu_spi_ipi_retries = 0;   // configurations whose words did not read back as written
 static void spiIpiConfigure (uintptr_t dist, uint32_t core, uint64_t aff)
 {
   const uint32_t id = kIpiSpiBase + core;
-  write32 (dist, 0x80 + (id / 32) * 4, read32 (dist, 0x80 + (id / 32) * 4) | (1U << (id % 32)));
-  write32 (dist, 0xc00 + (id / 16) * 4, read32 (dist, 0xc00 + (id / 16) * 4) | (2U << ((id % 16) * 2)));
+  const uint32_t group = 1U << (id % 32), edge = 2U << ((id % 16) * 2);
+  while (__atomic_exchange_n (&gSpiIpiLock, 1U, __ATOMIC_ACQUIRE) != 0) { __asm__ volatile ("yield"); }
+  for (int attempt = 0; attempt < 8; attempt++) {
+    write32 (dist, 0x80 + (id / 32) * 4, read32 (dist, 0x80 + (id / 32) * 4) | group);
+    write32 (dist, 0xc00 + (id / 16) * 4, read32 (dist, 0xc00 + (id / 16) * 4) | edge);
+    __asm__ volatile ("dsb sy" ::: "memory");
+    if ((read32 (dist, 0x80 + (id / 32) * 4) & group) && (read32 (dist, 0xc00 + (id / 16) * 4) & edge)) { break; }
+    armcpu_spi_ipi_retries = armcpu_spi_ipi_retries + 1;
+  }
+  __atomic_store_n (&gSpiIpiLock, 0U, __ATOMIC_RELEASE);
   write32 (dist, 0x400 + (id / 4) * 4, 0x80808080);
   *reinterpret_cast<volatile uint64_t *>(dist + 0x6000 + 8ULL * id) = aff & 0xff00ffffffULL;
   __asm__ volatile ("dsb sy" ::: "memory");
@@ -642,6 +658,10 @@ void ArmCpu::interrupt (void)
       if (ipi_handler != nullptr) { ipi_handler (); }
       armcpu_irq_phase=5;
     } else if (gSpiIpi && (id & 0xffffff) >= kIpiSpiBase && (id & 0xffffff) < kIpiSpiBase + 8) {
+      // Its pending state goes before the handler reads the signals: an IPI sent since pends it again, one sent before is handled now.
+      // An edge SPI is not pending once taken; this keeps a level one (spiIpiConfigure) from coming back forever.
+      const uint32_t intid = static_cast<uint32_t> (id & 0xffffff);
+      write32 (gDist, 0x280 + (intid / 32) * 4, 1U << (intid % 32));
       armcpu_ipi_interrupts = armcpu_ipi_interrupts + 1;
       armcpu_core_sgi[logicalId & 7] = armcpu_core_sgi[logicalId & 7] + 1;
       armcpu_irq_phase = 4;
