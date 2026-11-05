@@ -208,6 +208,11 @@ static bool gSmpWanted = false;
 static class ArmCpu *volatile gPending[ARMCPU_SMP_SLOTS];
 static volatile uint32_t gBootRegistered = 0;
 static bool gRemoteGic = false; // sheng-smp-gic=1: the boot CPU prepares a new core's redistributor before CPU_ON
+// Each CPU's idle latency (ml_processor_info_t powergate_latency, XNU's cpu_idle_latency): a delay shorter than it spins, a
+// longer one blocks, and the idle loop wakes this much before a timer. With none, every delay_for_interval/IODelay -- 1 us
+// too -- blocked on the one event all delaying threads share (clock_delay_until): a DroidVM guest's polling drivers queued
+// threads on that wait queue's lock, which timed out when its holder's vCPU lost the host CPU (lock-timeout panics, 2026-11-05).
+static constexpr uint32_t kIdleLatencyNs = 25000;
 
 // Shared peripheral interrupts (GICv3 SPIs, INTID 32..1019). A driver attaches a handler for one INTID; the line is set to
 // Group 1 non-secure, priority 0xa0, the given trigger and routed to the boot CPU (GICD_IROUTER, affinity routing is on),
@@ -451,6 +456,7 @@ bool ArmCpu::start (IOService *provider)
   info.log_id = logicalId;
   info.cluster_id = static_cast<uint32_t> (ml_get_cluster_number (physical));
   info.cluster_type = clusterType (physical);
+  info.powergate_latency = kIdleLatencyNs;
   // Darwin 25 kernels (xnu-12377) boot the processor from ml_processor_register, which calls initCPU and enables the GIC and
   // timer, so the boot CPU registers once its interrupt handler below is installed. Darwin 23 (xnu-10063) leaves initCPU to the
   // driver and registers first, as before: registering after the handler there cost a DroidVM guest half its frame rate
@@ -514,6 +520,7 @@ bool ArmCpu::finishSecondary (void)
   info.log_id = logicalId;
   info.cluster_id = static_cast<uint32_t> (ml_get_cluster_number (static_cast<uint32_t> (affinity)));
   info.cluster_type = clusterType (static_cast<uint32_t> (affinity));
+  info.powergate_latency = kIdleLatencyNs;
   perfmon_interrupt_handler_func pmi = nullptr;
   kern_return_t status = ml_processor_register (&info, &machProcessor, &ipi_handler, &pmi);
   if (status != KERN_SUCCESS) { armcpu_smp_fail[logicalId] = 4; return false; }
