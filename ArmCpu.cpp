@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 #include <IOKit/IOCPU.h>
+#include <IOKit/IOLib.h>
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <libkern/c++/OSData.h>
@@ -218,11 +219,20 @@ static constexpr uint32_t kIdleLatencyNs = 25000;
 // Group 1 non-secure, priority 0xa0, the given trigger and routed to the boot CPU (GICD_IROUTER, affinity routing is on),
 // then enabled. The handler runs in the primary interrupt context, before the EOI, and must clear a level source.
 // An SPI without a handler is counted and disabled instead of being acknowledged forever.
-#define ARMCPU_SPI_SLOTS 16
+// 128 slots: besides the virtio-mmio devices' lines, every MSI/MSI-X vector of a PCI device takes one of crosvm's MBI SPIs
+// (--mbi-spis, at most 64 today) through the MSI controller kext (DroidVMGicMsi), which keeps a line attached and masks and
+// unmasks it with armcpu_spi_set_enabled. gSpiSlot finds a line's slot by INTID (slot + 1, 0 for none) for the dispatch.
+#define ARMCPU_SPI_SLOTS 128
+#define ARMCPU_SPI_INTIDS 1020
 struct ArmCpuSpi {uint32_t id; void (*handler) (void *); void *context; volatile uint64_t count;};
 static ArmCpuSpi gSpi[ARMCPU_SPI_SLOTS];
 static volatile uint32_t gSpiUsed = 0;
+static volatile uint8_t gSpiSlot[ARMCPU_SPI_INTIDS];
+static IOLock *gSpiAttachLock = nullptr;
 static uint64_t gBootAffinity = 0;
+// Each running CPU's GICD_IROUTER value (its affinity), for armcpu_spi_distribute; gSpiCpuReady once the CPU takes interrupts.
+static uint64_t gSpiCpuAffinity[ARMCPU_SMP_SLOTS];
+static volatile uint32_t gSpiCpuReady[ARMCPU_SMP_SLOTS];
 extern "C" {
 volatile uint64_t armcpu_spi_unhandled = 0;
 volatile uint32_t armcpu_spi_unhandled_id = 0;
@@ -408,7 +418,7 @@ void ArmCpu::enableGic (void)
     armcpu_gic_boot[6] = static_cast<uint32_t> (ig);
     armcpu_gic_boot[7] = static_cast<uint32_t> (sre);
   }
-  armcpu_gic_ready = 1;
+  __atomic_store_n (&armcpu_gic_ready, 1U, __ATOMIC_RELEASE);
 }
 
 
@@ -607,6 +617,8 @@ void ArmCpu::initCPU (bool boot)
     ml_install_interrupt_handler (this, static_cast<int> (logicalId), this, reinterpret_cast<IOInterruptHandler> (&ArmCpu::dispatch), nullptr);
     enableCPUTimeBase (true);
     setCPUState (kIOCPUStateRunning);
+    gSpiCpuAffinity[logicalId] = affinity & 0xff00ffffffULL;
+    __atomic_store_n (&gSpiCpuReady[logicalId], 1U, __ATOMIC_RELEASE);
     armcpu_smp_step[logicalId] = 7;
     armcpu_smp_running = armcpu_smp_running + 1;
     // XNU clears SIGPdisabled for a core the first time that core takes an IPI, and cpu_signal() silently skips a core until then; Apple's
@@ -626,6 +638,10 @@ void ArmCpu::initCPU (bool boot)
   if (gSpiIpi) { spiIpiConfigure (gDist, logicalId, affinity); }
   enableCPUTimeBase (true);
   setCPUState (kIOCPUStateRunning);
+  if (logicalId < ARMCPU_SMP_SLOTS) {
+    gSpiCpuAffinity[logicalId] = affinity & 0xff00ffffffULL;
+    __atomic_store_n (&gSpiCpuReady[logicalId], 1U, __ATOMIC_RELEASE);
+  }
   bootInitialized = true;
   if (gSelfIpi) { signalCPU (this); }
 }
@@ -677,9 +693,9 @@ void ArmCpu::interrupt (void)
     } else {
       const uint32_t intid = static_cast<uint32_t> (id & 0xffffff);
       ArmCpuSpi *spi = nullptr;
-      const uint32_t used = __atomic_load_n (&gSpiUsed, __ATOMIC_ACQUIRE);
-      for (uint32_t slot = 0; intid >= 32 && slot < used && spi == nullptr; slot++) {
-        if (gSpi[slot].id == intid) { spi = &gSpi[slot]; }
+      if (intid >= 32 && intid < ARMCPU_SPI_INTIDS) {
+        const uint32_t slot = __atomic_load_n (&gSpiSlot[intid], __ATOMIC_ACQUIRE);
+        if (slot != 0) { spi = &gSpi[slot - 1]; }
       }
       if (spi != nullptr) {
         armcpu_irq_phase = 7;
@@ -871,17 +887,37 @@ const OSSymbol *ArmCpu::getCPUName (void)
   return cpuName;
 }
 
+static IOReturn spiAttachLocked (uint32_t intid, bool edge, void (*handler) (void *), void *context, uint32_t *readback,
+                                 uint64_t *router);
+
 // Readback after configuration: bit 0 group 1, bit 1 enabled, bit 2 edge, bits 8..15 priority; IROUTER separately.
 extern "C" IOReturn armcpu_spi_attach (uint32_t intid, bool edge, void (*handler) (void *), void *context,
                                        uint32_t *readback, uint64_t *router)
 {
+  // Driver matching can reach a device's interrupt setup (an MSI vector, a virtio-mmio line) before the boot CPU has set up the
+  // GIC: wait for it a while rather than fail the driver.
+  for (unsigned waited = 0; __atomic_load_n (&armcpu_gic_ready, __ATOMIC_ACQUIRE) == 0 && waited < 1000; waited++) { IOSleep (1); }
   if (gDist == 0 || armcpu_gic_ready == 0 || handler == nullptr) { return kIOReturnNotReady; }
   const unsigned interrupts = ((read32 (gDist, 4) & 31) + 1) * 32;
-  if (intid < 32 || intid >= 1020 || intid >= interrupts) { return kIOReturnBadArgument; }
-  const uint32_t used = __atomic_load_n (&gSpiUsed, __ATOMIC_ACQUIRE);
-  for (uint32_t slot = 0; slot < used; slot++) {
-    if (gSpi[slot].id == intid) { return kIOReturnExclusiveAccess; }
+  if (intid < 32 || intid >= ARMCPU_SPI_INTIDS || intid >= interrupts) { return kIOReturnBadArgument; }
+  // Attaches come from several drivers' threads at once (each PCI device's MSI vectors): one at a time.
+  if (__atomic_load_n (&gSpiAttachLock, __ATOMIC_ACQUIRE) == nullptr) {
+    IOLock *created = IOLockAlloc ();
+    if (created == nullptr) { return kIOReturnNoMemory; }
+    IOLock *none = nullptr;
+    if (!__atomic_compare_exchange_n (&gSpiAttachLock, &none, created, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) { IOLockFree (created); }
   }
+  IOLockLock (gSpiAttachLock);
+  const IOReturn result = spiAttachLocked (intid, edge, handler, context, readback, router);
+  IOLockUnlock (gSpiAttachLock);
+  return result;
+}
+
+static IOReturn spiAttachLocked (uint32_t intid, bool edge, void (*handler) (void *), void *context, uint32_t *readback,
+                                 uint64_t *router)
+{
+  if (__atomic_load_n (&gSpiSlot[intid], __ATOMIC_ACQUIRE) != 0) { return kIOReturnExclusiveAccess; }
+  const uint32_t used = __atomic_load_n (&gSpiUsed, __ATOMIC_ACQUIRE);
   if (used >= ARMCPU_SPI_SLOTS) { return kIOReturnNoResources; }
   const uint32_t word = (intid / 32) * 4, bit = 1U << (intid % 32);
   write32 (gDist, 0x180 + word, bit); // ICENABLER while it is reconfigured
@@ -893,6 +929,7 @@ extern "C" IOReturn armcpu_spi_attach (uint32_t intid, bool edge, void (*handler
   *reinterpret_cast<volatile uint64_t *> (gDist + 0x6000 + 8 * intid) = gBootAffinity;
   gSpi[used] = {intid, handler, context, 0};
   __atomic_store_n (&gSpiUsed, used + 1, __ATOMIC_RELEASE);
+  __atomic_store_n (&gSpiSlot[intid], static_cast<uint8_t> (used + 1), __ATOMIC_RELEASE);
   __asm__ volatile ("dsb sy" ::: "memory");
   write32 (gDist, 0x100 + word, bit); // ISENABLER
   if (readback != nullptr) {
@@ -904,11 +941,41 @@ extern "C" IOReturn armcpu_spi_attach (uint32_t intid, bool edge, void (*handler
   return kIOReturnSuccess;
 }
 
+// Masks or unmasks an attached SPI (ICENABLER/ISENABLER touch only the line's own bit): an MSI controller keeps a vector's line
+// attached and turns it off and on with IOInterruptController's disableVectorHard/enableVector. An edge that comes while the
+// line is masked stays pending in the distributor and is taken once it is unmasked.
+extern "C" IOReturn armcpu_spi_set_enabled (uint32_t intid, bool enabled)
+{
+  if (gDist == 0 || armcpu_gic_ready == 0) { return kIOReturnNotReady; }
+  if (intid < 32 || intid >= ARMCPU_SPI_INTIDS || __atomic_load_n (&gSpiSlot[intid], __ATOMIC_ACQUIRE) == 0) { return kIOReturnBadArgument; }
+  write32 (gDist, (enabled ? 0x100 : 0x180) + (intid / 32) * 4, 1U << (intid % 32));
+  return kIOReturnSuccess;
+}
+
+// Routes an attached SPI to the running CPU number Ordinal (modulo the running CPUs, in logical order), so a device's MSI vectors
+// spread over the CPUs instead of all landing on the boot CPU; best called while the line is masked. The CPU and the IROUTER
+// value read back are returned.
+extern "C" IOReturn armcpu_spi_distribute (uint32_t intid, uint32_t ordinal, uint32_t *cpu, uint64_t *router)
+{
+  if (gDist == 0 || armcpu_gic_ready == 0) { return kIOReturnNotReady; }
+  if (intid < 32 || intid >= ARMCPU_SPI_INTIDS || __atomic_load_n (&gSpiSlot[intid], __ATOMIC_ACQUIRE) == 0) { return kIOReturnBadArgument; }
+  uint32_t online[ARMCPU_SMP_SLOTS], count = 0;
+  for (uint32_t i = 0; i < ARMCPU_SMP_SLOTS; i++) {
+    if (__atomic_load_n (&gSpiCpuReady[i], __ATOMIC_ACQUIRE) != 0) { online[count++] = i; }
+  }
+  if (count == 0) { return kIOReturnNotReady; }
+  const uint32_t target = online[ordinal % count];
+  volatile uint64_t *route = reinterpret_cast<volatile uint64_t *> (gDist + 0x6000 + 8 * intid);
+  *route = gSpiCpuAffinity[target];
+  __asm__ volatile ("dsb sy" ::: "memory");
+  if (cpu != nullptr) { *cpu = target; }
+  if (router != nullptr) { *router = *route; }
+  return kIOReturnSuccess;
+}
+
 extern "C" uint64_t armcpu_spi_count (uint32_t intid)
 {
-  const uint32_t used = __atomic_load_n (&gSpiUsed, __ATOMIC_ACQUIRE);
-  for (uint32_t slot = 0; slot < used; slot++) {
-    if (gSpi[slot].id == intid) { return gSpi[slot].count; }
-  }
-  return 0;
+  if (intid < 32 || intid >= ARMCPU_SPI_INTIDS) { return 0; }
+  const uint32_t slot = __atomic_load_n (&gSpiSlot[intid], __ATOMIC_ACQUIRE);
+  return slot != 0 ? gSpi[slot - 1].count : 0;
 }
