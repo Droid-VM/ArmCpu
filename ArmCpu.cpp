@@ -32,6 +32,8 @@ volatile uint64_t armcpu_ipi_selftest_sent = 0;
 // 3 GICD_TYPER, 4 IGRPMODR0, 5 ICC_PMR_EL1, 6 ICC_IGRPEN1_EL1, 7 ICC_SRE_EL1.
 volatile uint32_t armcpu_gic_boot[8];
 volatile uint32_t armcpu_core_timer[8], armcpu_core_sgi[8];   // per logical core: architectural timer interrupts and SGI 0 taken
+// per logical core: device SPIs taken (virtio-mmio lines and MSI vectors, not the SPI IPIs), and of those the MBI lines (INTID 64..127)
+volatile uint32_t armcpu_core_spi[8], armcpu_core_mbi[8];
 static bool gSpiIpi = false;                // boot-arg armcpu-spi-ipi=1: IPIs are software-pended SPIs 1008+core routed to that core (ICC_SGI1R_EL1 generates nothing on this board)
 static bool gSelfIpi = false;               // boot-arg armcpu-self-ipi=1: every core sends itself SGI 0 from initCPU
 volatile uint32_t armcpu_irq_phase = 0,armcpu_irq_id = 1023;
@@ -700,6 +702,8 @@ void ArmCpu::interrupt (void)
       if (spi != nullptr) {
         armcpu_irq_phase = 7;
         spi->count = spi->count + 1;
+        armcpu_core_spi[logicalId & 7] = armcpu_core_spi[logicalId & 7] + 1;
+        if (intid >= 64 && intid < 128) { armcpu_core_mbi[logicalId & 7] = armcpu_core_mbi[logicalId & 7] + 1; }
         spi->handler (spi->context);
       } else if (intid >= 32 && gDist != 0) {
         armcpu_spi_unhandled = armcpu_spi_unhandled + 1;
@@ -954,7 +958,10 @@ extern "C" IOReturn armcpu_spi_set_enabled (uint32_t intid, bool enabled)
 
 // Routes an attached SPI to the running CPU number Ordinal (modulo the running CPUs, in logical order), so a device's MSI vectors
 // spread over the CPUs instead of all landing on the boot CPU; best called while the line is masked. The CPU and the IROUTER
-// value read back are returned.
+// value written are returned.
+// On Gunyah (5566, 11-18) the one 64-bit store routes it: a macOS VM's MSI vectors routed to CPUs 1..3 were taken there
+// (armcpu_core_mbi). Gunyah reads every IROUTER as 0, the SPI IPIs' too, so a read back tells nothing; and two 32-bit stores
+// (low half, then the high half 0) left the lines on CPU 0 in an experiment: keep it one 64-bit access.
 extern "C" IOReturn armcpu_spi_distribute (uint32_t intid, uint32_t ordinal, uint32_t *cpu, uint64_t *router)
 {
   if (gDist == 0 || armcpu_gic_ready == 0) { return kIOReturnNotReady; }
@@ -969,7 +976,7 @@ extern "C" IOReturn armcpu_spi_distribute (uint32_t intid, uint32_t ordinal, uin
   *route = gSpiCpuAffinity[target];
   __asm__ volatile ("dsb sy" ::: "memory");
   if (cpu != nullptr) { *cpu = target; }
-  if (router != nullptr) { *router = *route; }
+  if (router != nullptr) { *router = gSpiCpuAffinity[target]; }
   return kIOReturnSuccess;
 }
 
